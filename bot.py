@@ -7,6 +7,7 @@ import aiosqlite
 import tempfile
 from contextlib import suppress
 from html import escape
+from aiohttp import web
 
 # Включаем логирование в первую очередь
 logging.basicConfig(
@@ -91,14 +92,12 @@ async def db_init():
             )
         """)
         
-        # Безопасная миграция: проверяем наличие колонки перед добавлением
         async with db.execute("PRAGMA table_info(users)") as cursor:
             columns = {row[1] for row in await cursor.fetchall()}
 
         if "is_active" not in columns:
             await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
 
-        # Индекс для ускорения рассылок
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)")
             
         await db.execute("""
@@ -112,7 +111,8 @@ async def db_init():
         await db.commit()
 
 async def add_user(user_id: int, username: str, full_name: str):
-    if not user_id: return
+    if not user_id: 
+        return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, is_active)
@@ -181,7 +181,8 @@ async def run_ffmpeg(cmd: list, timeout=120):
 @dp.message(F.video)
 async def handle_video(message: types.Message):
     user = message.from_user
-    if not user: return
+    if not user: 
+        return
     
     await add_user(user.id, user.username, user.full_name)
             
@@ -222,7 +223,8 @@ async def handle_video(message: types.Message):
 @dp.message(F.audio | F.voice)
 async def handle_audio(message: types.Message):
     user = message.from_user
-    if not user: return
+    if not user: 
+        return
         
     await add_user(user.id, user.username, user.full_name)
 
@@ -275,7 +277,8 @@ def get_cancel_kb():
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id != ADMIN_ID: 
+        return
     await state.clear()
     await message.answer("🔧 <b>Админ-панель</b>\n\nВыберите действие:", reply_markup=get_admin_kb())
 
@@ -384,7 +387,8 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
 @dp.message(Command("donate"))
 async def cmd_donate(message: types.Message):
     user = message.from_user
-    if user: await add_user(user.id, user.username, user.full_name)
+    if user: 
+        await add_user(user.id, user.username, user.full_name)
         
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ 5 Звезд", callback_data="donate_5")
@@ -468,7 +472,8 @@ async def successful_payment(message: types.Message):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user = message.from_user
-    if user: await add_user(user.id, user.username, user.full_name)
+    if user: 
+        await add_user(user.id, user.username, user.full_name)
         
     await message.answer(
         "👋 Привет! Я бот-конвертер.\n\n"
@@ -476,6 +481,22 @@ async def cmd_start(message: types.Message):
         "🎵 Отправь мне <b>аудио</b> или <b>голосовое</b>, и я сделаю из него голосовое сообщение.\n\n"
         "⭐ Поддержать автора: /donate"
     )
+
+# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ BOTHOST ---
+async def handle_health(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Bothost обычно задает порт через переменную PORT. Если ее нет - берем 8080
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Веб-сервер для Bothost запущен на порту {port}")
 
 # --- ЗАПУСК ---
 async def main():
@@ -485,6 +506,10 @@ async def main():
     logging.info("FFmpeg: %s", FFMPEG_PATH)
 
     await db_init()
+    
+    # Запускаем веб-сервер в фоне
+    asyncio.create_task(start_web_server())
+    
     try:
         await dp.start_polling(bot)
     finally:
