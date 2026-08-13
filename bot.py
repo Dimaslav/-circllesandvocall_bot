@@ -8,7 +8,7 @@ import tempfile
 from contextlib import suppress
 from html import escape
 
-# Включаем логирование в первую очередь!
+# Включаем логирование в первую очередь
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -55,10 +55,15 @@ from aiogram.exceptions import (
 
 # --- ЧТЕНИЕ КОНФИГУРАЦИИ ---
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+except ValueError:
+    raise RuntimeError("ADMIN_ID должен быть числом.")
 
-if not TOKEN or not ADMIN_ID:
-    raise RuntimeError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID.")
+if not TOKEN:
+    raise RuntimeError("Не задана переменная окружения BOT_TOKEN.")
+if ADMIN_ID <= 0:
+    raise RuntimeError("ADMIN_ID не задан или некорректен.")
 
 MAX_CONCURRENT_TASKS = 2
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -82,15 +87,19 @@ async def db_init():
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
-                is_active INTEGER NOT NULL DEFAULT 1,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Если таблица уже существовала, добавляем колонку (для совместимости при обновлении)
-        try:
+        
+        # Безопасная миграция: проверяем наличие колонки перед добавлением
+        async with db.execute("PRAGMA table_info(users)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+
+        if "is_active" not in columns:
             await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
-        except aiosqlite.OperationalError:
-            pass # Колонка уже существует
+
+        # Индекс для ускорения рассылок
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)")
             
         await db.execute("""
             CREATE TABLE IF NOT EXISTS donations (
@@ -105,7 +114,6 @@ async def db_init():
 async def add_user(user_id: int, username: str, full_name: str):
     if not user_id: return
     async with aiosqlite.connect(DB_PATH) as db:
-        # Если пользователь уже есть в базе, обновляем его данные и ставим is_active = 1
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, is_active)
             VALUES (?, ?, ?, 1)
@@ -133,7 +141,6 @@ async def get_users_stats():
             return await cursor.fetchone()
 
 async def get_all_user_ids():
-    # Рассылаем только тем, кто активен
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users WHERE is_active = 1") as cursor:
             return [row[0] for row in await cursor.fetchall()]
@@ -290,7 +297,7 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
             "📊 <b>Статистика бота</b>\n\n"
             f"👥 Всего зарегистрировано: <b>{total}</b>\n"
             f"✅ Активных: <b>{active}</b>\n"
-            f"🚫 Недоступных (заблокировали): <b>{blocked}</b>"
+            f"🚫 Недоступных: <b>{blocked}</b>"
         )
         await callback.message.edit_text(text, reply_markup=get_admin_kb())
     
@@ -348,6 +355,10 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
                 await message.copy_to(chat_id=uid)
                 success += 1
                 await asyncio.sleep(0.05)
+            except TelegramForbiddenError:
+                failed += 1
+                deactivated += 1
+                await set_user_inactive(uid)
             except Exception:
                 failed += 1
                 logging.exception("Ошибка повторной отправки пользователю %s", uid)
