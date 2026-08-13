@@ -4,17 +4,32 @@ import uuid
 import logging
 import shutil
 import aiosqlite
+import tempfile
 from contextlib import suppress
+from html import escape
 
-# --- НАСТРОЙКА FFmpeg ДЛЯ DOCKER/ОБЛАЧНЫХ ХОСТИНГОВ ---
+# --- НАСТРОЙКА ПУТЕЙ ДЛЯ DOCKER ---
+DEFAULT_DATA_DIR = "/app/data"
+if os.path.isdir(DEFAULT_DATA_DIR):
+    DATA_DIR = DEFAULT_DATA_DIR
+else:
+    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATA_DIR = os.getenv("DATA_DIR", DATA_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Временные файлы пишем в /tmp, чтобы не засорять persistent volume
+TEMP_DIR = tempfile.gettempdir()
+
+# --- НАСТРОЙКА FFmpeg ---
 try:
     import imageio_ffmpeg
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    logging.info(f"Используется FFmpeg из imageio-ffmpeg: {FFMPEG_PATH}")
-except Exception:
+    logging.info(f"Используется FFmpeg: {FFMPEG_PATH}")
+except Exception as e:
     FFMPEG_PATH = shutil.which("ffmpeg")
     if not FFMPEG_PATH:
-        raise RuntimeError("FFmpeg не найден! Установите пакет imageio-ffmpeg или системный ffmpeg.")
+        raise RuntimeError(f"FFmpeg не найден! Ошибка: {e}")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -27,6 +42,11 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 
 # --- ЧТЕНИЕ КОНФИГУРАЦИИ ---
 TOKEN = os.getenv("BOT_TOKEN")
@@ -37,11 +57,10 @@ if not TOKEN or not ADMIN_ID:
 
 logging.basicConfig(level=logging.INFO)
 
-# Семафор ограничивает ВЕСЬ цикл обработки (скачивание + конвертация + отправка)
-MAX_CONCURRENT_TASKS = 3
+# Снизил до 2 для безопасности на дешевых тарифах
+MAX_CONCURRENT_TASKS = 2
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
-# Разрешенные суммы для доната
 DONATION_AMOUNTS = {5, 10, 50, 100, 500}
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -52,8 +71,10 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
 
 # --- БАЗА ДАННЫХ ---
+DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
+
 async def db_init():
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -74,7 +95,7 @@ async def db_init():
 
 async def add_user(user_id: int, username: str, full_name: str):
     if not user_id: return
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name)
             VALUES (?, ?, ?)
@@ -85,27 +106,27 @@ async def add_user(user_id: int, username: str, full_name: str):
         await db.commit()
 
 async def get_users_count():
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cursor:
             return (await cursor.fetchone())[0]
 
 async def get_all_user_ids():
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
             return [row[0] for row in await cursor.fetchall()]
 
 async def get_last_users(limit=5):
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id, username, full_name, joined_at FROM users ORDER BY joined_at DESC LIMIT ?", (limit,)) as cursor:
             return await cursor.fetchall()
 
 async def get_donations_stats():
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*), SUM(amount) FROM donations") as cursor:
             return await cursor.fetchone()
 
 async def add_donation(charge_id: str, user_id: int, amount: int):
-    async with aiosqlite.connect("bot_database.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO donations (charge_id, user_id, amount) VALUES (?, ?, ?)", (charge_id, user_id, amount))
         await db.commit()
 
@@ -138,8 +159,8 @@ async def handle_video(message: types.Message):
         with suppress(Exception): await message.forward(ADMIN_ID)
             
     status_msg = await message.reply("⏳ Ваше видео поставлено в очередь...")
-    input_path = f"temp_{uuid.uuid4()}"
-    output_path = f"circle_{uuid.uuid4()}.mp4"
+    input_path = os.path.join(TEMP_DIR, f"temp_{uuid.uuid4()}")
+    output_path = os.path.join(TEMP_DIR, f"circle_{uuid.uuid4()}.mp4")
     
     try:
         async with semaphore:
@@ -147,9 +168,8 @@ async def handle_video(message: types.Message):
             file = await bot.get_file(message.video.file_id)
             await bot.download_file(file.file_path, input_path)
             
-            # Используем FFMPEG_PATH вместо "ffmpeg"
             cmd = [
-                FFMPEG_PATH, "-y", "-i", input_path,
+                FFMPEG_PATH, "-nostdin", "-y", "-i", input_path,
                 "-vf", "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',scale=360:360",
                 "-t", "60", "-c:v", "libx264", "-preset", "fast", "-crf", "28",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "128k",
@@ -184,8 +204,8 @@ async def handle_audio(message: types.Message):
 
     status_msg = await message.reply("⏳ Ваше аудио поставлено в очередь...")
     file_id = message.audio.file_id if message.audio else message.voice.file_id
-    input_path = f"temp_{uuid.uuid4()}" 
-    output_path = f"voice_{uuid.uuid4()}.ogg"
+    input_path = os.path.join(TEMP_DIR, f"temp_{uuid.uuid4()}") 
+    output_path = os.path.join(TEMP_DIR, f"voice_{uuid.uuid4()}.ogg")
     
     try:
         async with semaphore:
@@ -193,8 +213,12 @@ async def handle_audio(message: types.Message):
             file = await bot.get_file(file_id)
             await bot.download_file(file.file_path, input_path)
             
-            # Используем FFMPEG_PATH вместо "ffmpeg"
-            cmd = [FFMPEG_PATH, "-y", "-i", input_path, "-c:a", "libopus", "-b:a", "64k", "-ac", "1", output_path]
+            # Добавлен -vn для удаления видео-дорожек из аудио-файлов (например, из mp4)
+            cmd = [
+                FFMPEG_PATH, "-nostdin", "-y", "-i", input_path, 
+                "-vn", "-c:a", "libopus", "-b:a", "64k", "-ac", "1", 
+                output_path
+            ]
             await run_ffmpeg(cmd)
             
             await bot.send_voice(
@@ -232,31 +256,39 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("🔧 <b>Админ-панель</b>\n\nВыберите действие:", reply_markup=get_admin_kb())
 
-@dp.callback_query(F.data.startswith("admin_"))
+# Строгая фильтрация, чтобы не перехватить admin_cancel
+@dp.callback_query(F.data.in_({"admin_stats", "admin_users", "admin_donations", "admin_broadcast"}))
 async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("У вас нет прав!", show_alert=True)
         return
 
-    action = callback.data.split("_")[1]
+    action = callback.data
     
-    if action == "stats":
+    if action == "admin_stats":
         count = await get_users_count()
         await callback.message.edit_text(f"📊 <b>Общая статистика</b>\n\n👤 Всего пользователей: <b>{count}</b>", reply_markup=get_admin_kb())
     
-    elif action == "users":
+    elif action == "admin_users":
         users = await get_last_users(5)
         text = "👥 <b>Последние 5 пользователей:</b>\n\n"
         for uid, uname, fname, joined in users:
-            text += f"• <a href='tg://user?id={uid}'>{fname}</a> (@{uname})\n   <i>{joined}</i>\n"
+            safe_name = escape(fname or "Без имени")
+            safe_username = escape(uname) if uname else "нет username"
+            
+            text += (
+                f'• <a href="tg://user?id={uid}">{safe_name}</a> '
+                f"({('@' + safe_username) if uname else safe_username})\n"
+                f"   <i>{joined}</i>\n"
+            )
         await callback.message.edit_text(text, reply_markup=get_admin_kb(), disable_web_page_preview=True)
     
-    elif action == "donations":
+    elif action == "admin_donations":
         count, total = await get_donations_stats()
         total = total if total else 0
         await callback.message.edit_text(f"💰 <b>Статистика донатов</b>\n\n✅ Успешных оплат: <b>{count}</b>\n⭐ Всего получено звезд: <b>{total}</b>", reply_markup=get_admin_kb())
     
-    elif action == "broadcast":
+    elif action == "admin_broadcast":
         await state.set_state(AdminStates.waiting_for_broadcast)
         await callback.message.edit_text("📢 <b>Рассылка</b>\n\nОтправьте сообщение (текст, фото, видео), которое нужно разослать ВСЕМ пользователям.\n\nДля отмены нажмите кнопку ниже.", reply_markup=get_cancel_kb())
     
@@ -283,8 +315,21 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
             await message.copy_to(chat_id=uid)
             success += 1
             await asyncio.sleep(0.05)
+
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await message.copy_to(chat_id=uid)
+                success += 1
+            except Exception:
+                failed += 1
+
+        except TelegramForbiddenError:
+            failed += 1
+
         except Exception:
             failed += 1
+            logging.exception("Ошибка рассылки пользователю %s", uid)
             
     await progress_msg.edit_text(f"✅ <b>Рассылка завершена!</b>\n\nУспешно отправлено: {success}\nНе доставлено (заблокировали бота): {failed}", reply_markup=get_admin_kb())
 
