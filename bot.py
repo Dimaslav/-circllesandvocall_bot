@@ -8,6 +8,12 @@ import tempfile
 from contextlib import suppress
 from html import escape
 
+# Включаем логирование в первую очередь!
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
 # --- НАСТРОЙКА ПУТЕЙ ДЛЯ DOCKER ---
 DEFAULT_DATA_DIR = "/app/data"
 if os.path.isdir(DEFAULT_DATA_DIR):
@@ -18,7 +24,6 @@ else:
 DATA_DIR = os.getenv("DATA_DIR", DATA_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Временные файлы пишем в /tmp, чтобы не засорять persistent volume
 TEMP_DIR = tempfile.gettempdir()
 
 # --- НАСТРОЙКА FFmpeg ---
@@ -53,11 +58,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 if not TOKEN or not ADMIN_ID:
-    raise RuntimeError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID. Проверьте файл .env")
+    raise RuntimeError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID.")
 
-logging.basicConfig(level=logging.INFO)
-
-# Снизил до 2 для безопасности на дешевых тарифах
 MAX_CONCURRENT_TASKS = 2
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -80,9 +82,16 @@ async def db_init():
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Если таблица уже существовала, добавляем колонку (для совместимости при обновлении)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        except aiosqlite.OperationalError:
+            pass # Колонка уже существует
+            
         await db.execute("""
             CREATE TABLE IF NOT EXISTS donations (
                 charge_id TEXT PRIMARY KEY,
@@ -96,23 +105,37 @@ async def db_init():
 async def add_user(user_id: int, username: str, full_name: str):
     if not user_id: return
     async with aiosqlite.connect(DB_PATH) as db:
+        # Если пользователь уже есть в базе, обновляем его данные и ставим is_active = 1
         await db.execute("""
-            INSERT INTO users (user_id, username, full_name)
-            VALUES (?, ?, ?)
+            INSERT INTO users (user_id, username, full_name, is_active)
+            VALUES (?, ?, ?, 1)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username,
-                full_name = excluded.full_name
+                full_name = excluded.full_name,
+                is_active = 1
         """, (user_id, username, full_name))
         await db.commit()
 
-async def get_users_count():
+async def set_user_inactive(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-            return (await cursor.fetchone())[0]
+        await db.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+async def get_users_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT 
+                COUNT(*), 
+                SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 
+                SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) 
+            FROM users
+        """) as cursor:
+            return await cursor.fetchone()
 
 async def get_all_user_ids():
+    # Рассылаем только тем, кто активен
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
+        async with db.execute("SELECT user_id FROM users WHERE is_active = 1") as cursor:
             return [row[0] for row in await cursor.fetchall()]
 
 async def get_last_users(limit=5):
@@ -154,9 +177,6 @@ async def handle_video(message: types.Message):
     if not user: return
     
     await add_user(user.id, user.username, user.full_name)
-    
-    if user.id != ADMIN_ID:
-        with suppress(Exception): await message.forward(ADMIN_ID)
             
     status_msg = await message.reply("⏳ Ваше видео поставлено в очередь...")
     input_path = os.path.join(TEMP_DIR, f"temp_{uuid.uuid4()}")
@@ -198,9 +218,6 @@ async def handle_audio(message: types.Message):
     if not user: return
         
     await add_user(user.id, user.username, user.full_name)
-    
-    if user.id != ADMIN_ID:
-        with suppress(Exception): await message.forward(ADMIN_ID)
 
     status_msg = await message.reply("⏳ Ваше аудио поставлено в очередь...")
     file_id = message.audio.file_id if message.audio else message.voice.file_id
@@ -213,7 +230,6 @@ async def handle_audio(message: types.Message):
             file = await bot.get_file(file_id)
             await bot.download_file(file.file_path, input_path)
             
-            # Добавлен -vn для удаления видео-дорожек из аудио-файлов (например, из mp4)
             cmd = [
                 FFMPEG_PATH, "-nostdin", "-y", "-i", input_path, 
                 "-vn", "-c:a", "libopus", "-b:a", "64k", "-ac", "1", 
@@ -256,7 +272,6 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("🔧 <b>Админ-панель</b>\n\nВыберите действие:", reply_markup=get_admin_kb())
 
-# Строгая фильтрация, чтобы не перехватить admin_cancel
 @dp.callback_query(F.data.in_({"admin_stats", "admin_users", "admin_donations", "admin_broadcast"}))
 async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -266,8 +281,18 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     action = callback.data
     
     if action == "admin_stats":
-        count = await get_users_count()
-        await callback.message.edit_text(f"📊 <b>Общая статистика</b>\n\n👤 Всего пользователей: <b>{count}</b>", reply_markup=get_admin_kb())
+        total, active, blocked = await get_users_stats()
+        total = total or 0
+        active = active or 0
+        blocked = blocked or 0
+        
+        text = (
+            "📊 <b>Статистика бота</b>\n\n"
+            f"👥 Всего зарегистрировано: <b>{total}</b>\n"
+            f"✅ Активных: <b>{active}</b>\n"
+            f"🚫 Недоступных (заблокировали): <b>{blocked}</b>"
+        )
+        await callback.message.edit_text(text, reply_markup=get_admin_kb())
     
     elif action == "admin_users":
         users = await get_last_users(5)
@@ -290,7 +315,7 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     
     elif action == "admin_broadcast":
         await state.set_state(AdminStates.waiting_for_broadcast)
-        await callback.message.edit_text("📢 <b>Рассылка</b>\n\nОтправьте сообщение (текст, фото, видео), которое нужно разослать ВСЕМ пользователям.\n\nДля отмены нажмите кнопку ниже.", reply_markup=get_cancel_kb())
+        await callback.message.edit_text("📢 <b>Рассылка</b>\n\nОтправьте сообщение (текст, фото, видео), которое нужно разослать ВСЕМ активным пользователям.\n\nДля отмены нажмите кнопку ниже.", reply_markup=get_cancel_kb())
     
     await callback.answer()
 
@@ -309,6 +334,7 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
     
     success = 0
     failed = 0
+    deactivated = 0
     
     for uid in user_ids:
         try:
@@ -321,17 +347,27 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
             try:
                 await message.copy_to(chat_id=uid)
                 success += 1
+                await asyncio.sleep(0.05)
             except Exception:
                 failed += 1
+                logging.exception("Ошибка повторной отправки пользователю %s", uid)
 
         except TelegramForbiddenError:
             failed += 1
+            deactivated += 1
+            await set_user_inactive(uid)
 
         except Exception:
             failed += 1
             logging.exception("Ошибка рассылки пользователю %s", uid)
             
-    await progress_msg.edit_text(f"✅ <b>Рассылка завершена!</b>\n\nУспешно отправлено: {success}\nНе доставлено (заблокировали бота): {failed}", reply_markup=get_admin_kb())
+    await progress_msg.edit_text(
+        "✅ <b>Рассылка завершена!</b>\n\n"
+        f"✅ Успешно: {success}\n"
+        f"❌ Не доставлено: {failed}\n"
+        f"🚫 Заблокировали бота: {deactivated}",
+        reply_markup=get_admin_kb()
+    )
 
 # --- ДОНАТ (TELEGRAM STARS) ---
 @dp.message(Command("donate"))
@@ -362,7 +398,7 @@ async def process_donate(callback: types.CallbackQuery):
         return
 
     await bot.send_invoice(
-        chat_id=callback.message.chat.id,
+        chat_id=callback.from_user.id,
         title="Поддержка разработчика",
         description=f"Оплата {amount} Telegram Stars в качестве благодарности",
         payload=f"donate:{amount}",
@@ -393,14 +429,28 @@ async def pre_checkout_query(query: types.PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: types.Message):
-    payment_info = message.successful_payment
+    payment = message.successful_payment
+    expected_payload = f"donate:{payment.total_amount}"
+
+    if (
+        payment.currency != "XTR"
+        or payment.total_amount not in DONATION_AMOUNTS
+        or payment.invoice_payload != expected_payload
+    ):
+        logging.error("Некорректный successful_payment: %s", payment)
+        return
+
     user = message.from_user
-    if user: await add_donation(payment_info.telegram_payment_charge_id, user.id, payment_info.total_amount)
-        
+    if user:
+        await add_donation(
+            payment.telegram_payment_charge_id,
+            user.id,
+            payment.total_amount
+        )
+
     await message.answer(
         f"🎉 <b>Спасибо за вашу поддержку!</b>\n\n"
-        f"Вы отправили {payment_info.total_amount} ⭐.\n"
-        f"Благодаря вам бот будет работать и развиваться!"
+        f"Вы отправили {payment.total_amount} ⭐."
     )
 
 # --- /start ---
@@ -418,6 +468,11 @@ async def cmd_start(message: types.Message):
 
 # --- ЗАПУСК ---
 async def main():
+    logging.info("DATA_DIR: %s", DATA_DIR)
+    logging.info("TEMP_DIR: %s", TEMP_DIR)
+    logging.info("DB_PATH: %s", DB_PATH)
+    logging.info("FFmpeg: %s", FFMPEG_PATH)
+
     await db_init()
     try:
         await dp.start_polling(bot)
