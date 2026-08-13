@@ -9,7 +9,7 @@ from contextlib import suppress
 from html import escape
 from aiohttp import web
 
-# Включаем логирование в первую очередь
+# Включаем логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -66,7 +66,6 @@ if not TOKEN:
 if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID не задан или некорректен.")
 
-# СНИЗИЛИ ДО 1 ДЛЯ ДИАГНОСТИКИ
 MAX_CONCURRENT_TASKS = 1
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -75,7 +74,7 @@ DONATION_AMOUNTS = {5, 10, 50, 100, 500}
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# --- FSM СОСТОЯНИЯ ДЛЯ АДМИНА ---
+# --- FSM СОСТОЯНИЯ ---
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
 
@@ -108,7 +107,7 @@ async def db_init():
         await db.commit()
 
 async def add_user(user_id: int, username: str, full_name: str):
-    if not user_id: 
+    if not user_id:
         return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -128,7 +127,12 @@ async def set_user_inactive(user_id: int):
 
 async def get_users_stats():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*), SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) FROM users") as cursor:
+        async with db.execute("""
+            SELECT COUNT(*), 
+                   SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 
+                   SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) 
+            FROM users
+        """) as cursor:
             return await cursor.fetchone()
 
 async def get_all_user_ids():
@@ -153,7 +157,11 @@ async def add_donation(charge_id: str, user_id: int, amount: int):
 
 # --- FFmpeg ---
 async def run_ffmpeg(cmd: list, timeout=120):
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE
+    )
     try:
         _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -164,110 +172,95 @@ async def run_ffmpeg(cmd: list, timeout=120):
         logging.error("FFmpeg error: %s", stderr.decode(errors="replace"))
         raise RuntimeError("FFmpeg processing failed")
 
-# --- ОБРАБОТЧИК ВИДЕО (С ДИАГНОСТИКОЙ) ---
+# --- ОБРАБОТЧИК ВИДЕО (ВЫБОР ДЕЙСТВИЯ) ---
+def get_video_actions_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎬 В кружок", callback_data="vid_to_note")
+    builder.button(text="🎵 В аудио (MP3)", callback_data="vid_to_mp3")
+    builder.button(text="🎤 В войс", callback_data="vid_to_voice")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
 @dp.message(F.video)
 async def handle_video(message: types.Message):
     user = message.from_user
-    if not user: 
+    if not user:
+        return
+    await add_user(user.id, user.username, user.full_name)
+    await message.reply("Видео получено! Что с ним сделать?", reply_markup=get_video_actions_kb())
+
+# --- ОБРАБОТЧИК КНОПОК ВИДЕО ---
+@dp.callback_query(F.data.startswith("vid_to_"))
+async def process_video_action(callback: types.CallbackQuery):
+    user = callback.from_user
+    if not user:
         return
 
-    await add_user(user.id, user.username, user.full_name)
+    if not callback.message or not callback.message.reply_to_message or not callback.message.reply_to_message.video:
+        await callback.answer("Видео не найдено. Отправьте его заново.", show_alert=True)
+        return
 
-    status_msg = await message.reply("⏳ Ваше видео поставлено в очередь...")
+    video = callback.message.reply_to_message.video
+    action = callback.data.split("vid_to_")[1]
 
-    input_path = os.path.join(TEMP_DIR, f"temp_{uuid.uuid4()}.mp4")
-    output_path = os.path.join(TEMP_DIR, f"circle_{uuid.uuid4()}.mp4")
+    await callback.message.edit_text("⏳ Обработка...")
+
+    input_path = os.path.join(TEMP_DIR, f"temp_{uuid.uuid4()}")
+    output_path = os.path.join(TEMP_DIR, f"out_{uuid.uuid4()}")
 
     try:
         async with semaphore:
-            await status_msg.edit_text("⏳ Конвертирую видео в кружок...")
-
-            logging.info("VIDEO user=%s: начинаю скачивание", user.id)
-
-            file = await bot.get_file(message.video.file_id)
+            file = await bot.get_file(video.file_id)
             await bot.download_file(file.file_path, input_path)
 
-            input_size = os.path.getsize(input_path)
+            if action == "note":
+                output_path += ".mp4"
+                cmd = [
+                    FFMPEG_PATH, "-nostdin", "-y", "-i", input_path,
+                    "-vf", "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',scale=360:360",
+                    "-t", "60", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "128k",
+                    output_path
+                ]
+                await run_ffmpeg(cmd)
+                await bot.send_video_note(chat_id=user.id, video_note=FSInputFile(output_path))
 
-            logging.info(
-                "VIDEO user=%s: скачано %.2f MB",
-                user.id,
-                input_size / 1024 / 1024
-            )
+            elif action == "mp3":
+                output_path += ".mp3"
+                cmd = [
+                    FFMPEG_PATH, "-nostdin", "-y", "-i", input_path,
+                    "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+                    output_path
+                ]
+                await run_ffmpeg(cmd)
+                await bot.send_audio(chat_id=user.id, audio=FSInputFile(output_path))
 
-            cmd = [
-                FFMPEG_PATH,
-                "-nostdin",
-                "-y",
-                "-i", input_path,
+            elif action == "voice":
+                output_path += ".ogg"
+                cmd = [
+                    FFMPEG_PATH, "-nostdin", "-y", "-i", input_path,
+                    "-vn", "-c:a", "libopus", "-b:a", "64k", "-ac", "1",
+                    output_path
+                ]
+                await run_ffmpeg(cmd)
+                await bot.send_voice(chat_id=user.id, voice=FSInputFile(output_path))
 
-                "-vf",
-                "crop='min(iw,ih)':'min(iw,ih)':"
-                "'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',"
-                "scale=360:360",
-
-                "-t", "60",
-
-                "-c:v", "libx264",
-                "-preset", "ultrafast", # СНИЗИЛИ НАГРУЗКУ НА CPU
-                "-crf", "28",
-
-                "-pix_fmt", "yuv420p",
-
-                "-c:a", "aac",
-                "-b:a", "96k",
-
-                "-movflags", "+faststart",
-
-                output_path
-            ]
-
-            logging.info("VIDEO user=%s: запускаю FFmpeg", user.id)
-
-            await run_ffmpeg(cmd)
-
-            if not os.path.exists(output_path):
-                raise RuntimeError("FFmpeg не создал выходной файл")
-
-            output_size = os.path.getsize(output_path)
-
-            logging.info(
-                "VIDEO user=%s: FFmpeg готов, размер %.2f MB",
-                user.id,
-                output_size / 1024 / 1024
-            )
-
-            logging.info("VIDEO user=%s: отправляю кружок в Telegram", user.id)
-
-            await bot.send_video_note(
-                chat_id=message.chat.id,
-                video_note=FSInputFile(output_path),
-                reply_to_message_id=message.message_id
-            )
-
-            logging.info("VIDEO user=%s: успешно завершено", user.id)
+            await callback.message.delete()
 
     except Exception:
-        logging.exception("VIDEO user=%s: ошибка обработки", user.id)
-        
+        logging.exception("Video action failed")
         with suppress(Exception):
-            await message.reply("❌ Не удалось обработать видео. Попробуйте другой файл.")
-
+            await callback.message.edit_text("❌ Не удалось обработать видео. Попробуйте другой файл.")
     finally:
-        with suppress(FileNotFoundError):
-            os.remove(input_path)
-
-        with suppress(FileNotFoundError):
-            os.remove(output_path)
-
-        with suppress(Exception):
-            await status_msg.delete()
+        with suppress(FileNotFoundError): os.remove(input_path)
+        with suppress(FileNotFoundError): os.remove(output_path)
+        with suppress(Exception): await callback.answer()
 
 # --- ОБРАБОТЧИК АУДИО ---
 @dp.message(F.audio | F.voice)
 async def handle_audio(message: types.Message):
     user = message.from_user
-    if not user: 
+    if not user:
         return
         
     await add_user(user.id, user.username, user.full_name)
@@ -321,7 +314,7 @@ def get_cancel_kb():
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: 
+    if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
     await message.answer("🔧 <b>Админ-панель</b>\n\nВыберите действие:", reply_markup=get_admin_kb())
@@ -339,7 +332,6 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
         total = total or 0
         active = active or 0
         blocked = blocked or 0
-        
         text = (
             "📊 <b>Статистика бота</b>\n\n"
             f"👥 Всего зарегистрировано: <b>{total}</b>\n"
@@ -354,7 +346,6 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
         for uid, uname, fname, joined in users:
             safe_name = escape(fname or "Без имени")
             safe_username = escape(uname) if uname else "нет username"
-            
             text += (
                 f'• <a href="tg://user?id={uid}">{safe_name}</a> '
                 f"({('@' + safe_username) if uname else safe_username})\n"
@@ -369,7 +360,7 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     
     elif action == "admin_broadcast":
         await state.set_state(AdminStates.waiting_for_broadcast)
-        await callback.message.edit_text("📢 <b>Рассылка</b>\n\nОтправьте сообщение (текст, фото, видео), которое нужно разослать ВСЕМ активным пользователям.\n\nДля отмены нажмите кнопку ниже.", reply_markup=get_cancel_kb())
+        await callback.message.edit_text("📢 <b>Рассылка</b>\n\nОтправьте сообщение для всех активных пользователей.\n\nДля отмены нажмите кнопку ниже.", reply_markup=get_cancel_kb())
     
     await callback.answer()
 
@@ -431,7 +422,7 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
 @dp.message(Command("donate"))
 async def cmd_donate(message: types.Message):
     user = message.from_user
-    if user: 
+    if user:
         await add_user(user.id, user.username, user.full_name)
         
     builder = InlineKeyboardBuilder()
@@ -516,13 +507,16 @@ async def successful_payment(message: types.Message):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user = message.from_user
-    if user: 
+    if user:
         await add_user(user.id, user.username, user.full_name)
         
     await message.answer(
         "👋 Привет! Я бот-конвертер.\n\n"
-        "📹 Отправь мне <b>видео</b>, и я сделаю из него видео-сообщение (кружок).\n"
-        "🎵 Отправь мне <b>аудио</b> или <b>голосовое</b>, и я сделаю из него голосовое сообщение.\n\n"
+        "📹 Отправь мне <b>видео</b>, и выбери, что сделать:\n"
+        "   — 🎬 Кружок\n"
+        "   — 🎵 Извлечь аудио (MP3)\n"
+        "   — 🎤 В голосовое сообщение\n\n"
+        "🎵 Отправь мне <b>аудио</b> или <b>голосовое</b>, и я сделаю из него войс.\n\n"
         "⭐ Поддержать автора: /donate"
     )
 
@@ -535,7 +529,6 @@ async def start_web_server():
     app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
     runner = web.AppRunner(app)
     await runner.setup()
-    
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
@@ -549,8 +542,6 @@ async def main():
     logging.info("FFmpeg: %s", FFMPEG_PATH)
 
     await db_init()
-    
-    # Запускаем веб-сервер напрямую до поллинга
     await start_web_server()
     
     try:
