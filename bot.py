@@ -83,6 +83,9 @@ DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
 
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -96,6 +99,7 @@ async def db_init():
         if "is_active" not in columns:
             await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active)")
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS donations (
                 charge_id TEXT PRIMARY KEY,
@@ -104,11 +108,48 @@ async def db_init():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_videos (
+                video_key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
+async def cleanup_pending_videos():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pending_videos WHERE created_at < datetime('now', '-1 day')")
+        await db.commit()
+
+async def save_pending_video(video_key: str, user_id: int, chat_id: int, message_id: int, file_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO pending_videos (video_key, user_id, chat_id, message_id, file_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (video_key, user_id, chat_id, message_id, file_id))
+        await db.commit()
+
+async def take_pending_video(video_key: str, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT chat_id, message_id, file_id FROM pending_videos 
+            WHERE video_key = ? AND user_id = ?
+        """, (video_key, user_id)) as cursor:
+            row = await cursor.fetchone()
+
+        if row:
+            await db.execute("DELETE FROM pending_videos WHERE video_key = ?", (video_key,))
+            await db.commit()
+
+        return row
+
 async def add_user(user_id: int, username: str, full_name: str):
-    if not user_id:
-        return
+    if not user_id: return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, is_active)
@@ -172,37 +213,59 @@ async def run_ffmpeg(cmd: list, timeout=120):
         logging.error("FFmpeg error: %s", stderr.decode(errors="replace"))
         raise RuntimeError("FFmpeg processing failed")
 
-# --- ОБРАБОТЧИК ВИДЕО (ВЫБОР ДЕЙСТВИЯ) ---
-def get_video_actions_kb():
+# --- ОБРАБОТЧИК ВИДЕО ---
+def get_video_actions_kb(video_key: str):
     builder = InlineKeyboardBuilder()
-    builder.button(text="🎬 В кружок", callback_data="vid_to_note")
-    builder.button(text="🎵 В аудио (MP3)", callback_data="vid_to_mp3")
-    builder.button(text="🎤 В войс", callback_data="vid_to_voice")
+    builder.button(text="🎬 В кружок", callback_data=f"video:note:{video_key}")
+    builder.button(text="🎵 В аудио (MP3)", callback_data=f"video:mp3:{video_key}")
+    builder.button(text="🎤 В войс", callback_data=f"video:voice:{video_key}")
     builder.adjust(2, 1)
     return builder.as_markup()
 
 @dp.message(F.video)
 async def handle_video(message: types.Message):
     user = message.from_user
-    if not user:
-        return
+    if not user: return
+    
     await add_user(user.id, user.username, user.full_name)
-    await message.reply("Видео получено! Что с ним сделать?", reply_markup=get_video_actions_kb())
+    
+    video_key = uuid.uuid4().hex[:12]
+    
+    await save_pending_video(
+        video_key=video_key,
+        user_id=user.id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        file_id=message.video.file_id
+    )
+    
+    await message.reply("Видео получено! Что с ним сделать?", reply_markup=get_video_actions_kb(video_key))
 
 # --- ОБРАБОТЧИК КНОПОК ВИДЕО ---
-@dp.callback_query(F.data.startswith("vid_to_"))
+@dp.callback_query(F.data.startswith("video:"))
 async def process_video_action(callback: types.CallbackQuery):
     user = callback.from_user
-    if not user:
+    if not user: return
+
+    try:
+        _, action, video_key = callback.data.split(":")
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректная кнопка.", show_alert=True)
         return
 
-    if not callback.message or not callback.message.reply_to_message or not callback.message.reply_to_message.video:
-        await callback.answer("Видео не найдено. Отправьте его заново.", show_alert=True)
+    if action not in {"note", "mp3", "voice"}:
+        await callback.answer("Неизвестное действие.", show_alert=True)
         return
 
-    video = callback.message.reply_to_message.video
-    action = callback.data.split("vid_to_")[1]
+    video_data = await take_pending_video(video_key, user.id)
 
+    if not video_data:
+        await callback.answer("Это видео уже обработано или устарело. Отправьте его заново.", show_alert=True)
+        return
+
+    chat_id, original_message_id, file_id = video_data
+
+    await callback.answer()
     await callback.message.edit_text("⏳ Обработка...")
 
     input_path = os.path.join(TEMP_DIR, f"temp_{uuid.uuid4()}")
@@ -210,21 +273,25 @@ async def process_video_action(callback: types.CallbackQuery):
 
     try:
         async with semaphore:
-            file = await bot.get_file(video.file_id)
+            logging.info("VIDEO action=%s user=%s: скачивание", action, user.id)
+            file = await bot.get_file(file_id)
             await bot.download_file(file.file_path, input_path)
+
+            logging.info(
+                "VIDEO action=%s user=%s: скачано %.2f MB",
+                action, user.id,
+                os.path.getsize(input_path) / 1024 / 1024
+            )
 
             if action == "note":
                 output_path += ".mp4"
                 cmd = [
                     FFMPEG_PATH, "-nostdin", "-y", "-i", input_path,
-                    "-vf", "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',scale=360:360",
-                    "-t", "60", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-vf", "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',scale=360:360,fps=30",
+                    "-t", "60", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "2",
                     "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "128k",
                     output_path
                 ]
-                await run_ffmpeg(cmd)
-                await bot.send_video_note(chat_id=user.id, video_note=FSInputFile(output_path))
-
             elif action == "mp3":
                 output_path += ".mp3"
                 cmd = [
@@ -232,9 +299,6 @@ async def process_video_action(callback: types.CallbackQuery):
                     "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
                     output_path
                 ]
-                await run_ffmpeg(cmd)
-                await bot.send_audio(chat_id=user.id, audio=FSInputFile(output_path))
-
             elif action == "voice":
                 output_path += ".ogg"
                 cmd = [
@@ -242,26 +306,43 @@ async def process_video_action(callback: types.CallbackQuery):
                     "-vn", "-c:a", "libopus", "-b:a", "64k", "-ac", "1",
                     output_path
                 ]
-                await run_ffmpeg(cmd)
-                await bot.send_voice(chat_id=user.id, voice=FSInputFile(output_path))
 
+            logging.info("VIDEO action=%s user=%s: запуск FFmpeg", action, user.id)
+            await run_ffmpeg(cmd)
+            
+            logging.info(
+                "VIDEO action=%s user=%s: FFmpeg готов %.2f MB",
+                action, user.id,
+                os.path.getsize(output_path) / 1024 / 1024
+            )
+
+            if action == "note":
+                await bot.send_video_note(chat_id=chat_id, video_note=FSInputFile(output_path), reply_to_message_id=original_message_id)
+            elif action == "mp3":
+                await bot.send_audio(chat_id=chat_id, audio=FSInputFile(output_path), reply_to_message_id=original_message_id)
+            elif action == "voice":
+                await bot.send_voice(chat_id=chat_id, voice=FSInputFile(output_path), reply_to_message_id=original_message_id)
+
+            logging.info("VIDEO action=%s user=%s: готово", action, user.id)
             await callback.message.delete()
 
     except Exception:
         logging.exception("Video action failed")
         with suppress(Exception):
-            await callback.message.edit_text("❌ Не удалось обработать видео. Попробуйте другой файл.")
+            # Более понятная ошибка для аудио
+            if action in {"mp3", "voice"}:
+                await callback.message.edit_text("❌ Не удалось извлечь аудио. Возможно, в видео нет звуковой дорожки.")
+            else:
+                await callback.message.edit_text("❌ Не удалось обработать видео. Попробуйте другой файл.")
     finally:
         with suppress(FileNotFoundError): os.remove(input_path)
         with suppress(FileNotFoundError): os.remove(output_path)
-        with suppress(Exception): await callback.answer()
 
 # --- ОБРАБОТЧИК АУДИО ---
 @dp.message(F.audio | F.voice)
 async def handle_audio(message: types.Message):
     user = message.from_user
-    if not user:
-        return
+    if not user: return
         
     await add_user(user.id, user.username, user.full_name)
 
@@ -314,8 +395,7 @@ def get_cancel_kb():
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id != ADMIN_ID: return
     await state.clear()
     await message.answer("🔧 <b>Админ-панель</b>\n\nВыберите действие:", reply_markup=get_admin_kb())
 
@@ -492,6 +572,7 @@ async def successful_payment(message: types.Message):
 
     user = message.from_user
     if user:
+        await add_user(user.id, user.username, user.full_name)
         await add_donation(
             payment.telegram_payment_charge_id,
             user.id,
@@ -520,7 +601,7 @@ async def cmd_start(message: types.Message):
         "⭐ Поддержать автора: /donate"
     )
 
-# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ BOTHOST ---
+# --- HEALTHCHECK ВЕБ-СЕРВЕР ДЛЯ BOTHOST ---
 async def handle_health(request):
     return web.Response(text="OK")
 
@@ -542,6 +623,7 @@ async def main():
     logging.info("FFmpeg: %s", FFMPEG_PATH)
 
     await db_init()
+    await cleanup_pending_videos()
     await start_web_server()
     
     try:
