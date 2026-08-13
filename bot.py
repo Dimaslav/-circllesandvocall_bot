@@ -6,6 +6,16 @@ import shutil
 import aiosqlite
 from contextlib import suppress
 
+# --- НАСТРОЙКА FFmpeg ДЛЯ DOCKER/ОБЛАЧНЫХ ХОСТИНГОВ ---
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    logging.info(f"Используется FFmpeg из imageio-ffmpeg: {FFMPEG_PATH}")
+except Exception:
+    FFMPEG_PATH = shutil.which("ffmpeg")
+    if not FFMPEG_PATH:
+        raise RuntimeError("FFmpeg не найден! Установите пакет imageio-ffmpeg или системный ffmpeg.")
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -18,20 +28,20 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-# Чтение конфигурации
+# --- ЧТЕНИЕ КОНФИГУРАЦИИ ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 if not TOKEN or not ADMIN_ID:
     raise RuntimeError("Не заданы переменные окружения BOT_TOKEN или ADMIN_ID. Проверьте файл .env")
 
-if shutil.which("ffmpeg") is None:
-    raise RuntimeError("FFmpeg не установлен или отсутствует в PATH.")
-
 logging.basicConfig(level=logging.INFO)
 
+# Семафор ограничивает ВЕСЬ цикл обработки (скачивание + конвертация + отправка)
 MAX_CONCURRENT_TASKS = 3
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+
+# Разрешенные суммы для доната
 DONATION_AMOUNTS = {5, 10, 50, 100, 500}
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -101,7 +111,11 @@ async def add_donation(charge_id: str, user_id: int, amount: int):
 
 # --- FFmpeg ---
 async def run_ffmpeg(cmd: list, timeout=120):
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE
+    )
     try:
         _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -119,6 +133,7 @@ async def handle_video(message: types.Message):
     if not user: return
     
     await add_user(user.id, user.username, user.full_name)
+    
     if user.id != ADMIN_ID:
         with suppress(Exception): await message.forward(ADMIN_ID)
             
@@ -132,15 +147,22 @@ async def handle_video(message: types.Message):
             file = await bot.get_file(message.video.file_id)
             await bot.download_file(file.file_path, input_path)
             
+            # Используем FFMPEG_PATH вместо "ffmpeg"
             cmd = [
-                "ffmpeg", "-y", "-i", input_path,
+                FFMPEG_PATH, "-y", "-i", input_path,
                 "-vf", "crop='min(iw,ih)':'min(iw,ih)':'(iw-min(iw,ih))/2':'(ih-min(iw,ih))/2',scale=360:360",
                 "-t", "60", "-c:v", "libx264", "-preset", "fast", "-crf", "28",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "128k",
                 output_path
             ]
             await run_ffmpeg(cmd)
-            await bot.send_video_note(chat_id=message.chat.id, video_note=FSInputFile(output_path), reply_to_message_id=message.message_id)
+            
+            await bot.send_video_note(
+                chat_id=message.chat.id,
+                video_note=FSInputFile(output_path),
+                reply_to_message_id=message.message_id
+            )
+            
     except Exception:
         logging.exception("Video processing failed")
         await message.reply("❌ Не удалось обработать видео. Попробуйте другой файл.")
@@ -156,6 +178,7 @@ async def handle_audio(message: types.Message):
     if not user: return
         
     await add_user(user.id, user.username, user.full_name)
+    
     if user.id != ADMIN_ID:
         with suppress(Exception): await message.forward(ADMIN_ID)
 
@@ -169,9 +192,17 @@ async def handle_audio(message: types.Message):
             await status_msg.edit_text("⏳ Конвертирую аудио в голосовое сообщение...")
             file = await bot.get_file(file_id)
             await bot.download_file(file.file_path, input_path)
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-c:a", "libopus", "-b:a", "64k", "-ac", "1", output_path]
+            
+            # Используем FFMPEG_PATH вместо "ffmpeg"
+            cmd = [FFMPEG_PATH, "-y", "-i", input_path, "-c:a", "libopus", "-b:a", "64k", "-ac", "1", output_path]
             await run_ffmpeg(cmd)
-            await bot.send_voice(chat_id=message.chat.id, voice=FSInputFile(output_path), reply_to_message_id=message.message_id)
+            
+            await bot.send_voice(
+                chat_id=message.chat.id,
+                voice=FSInputFile(output_path),
+                reply_to_message_id=message.message_id
+            )
+            
     except Exception:
         logging.exception("Audio processing failed")
         await message.reply("❌ Не удалось обработать аудио. Попробуйте другой файл.")
@@ -190,10 +221,15 @@ def get_admin_kb():
     builder.adjust(2, 2)
     return builder.as_markup()
 
+def get_cancel_kb():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="admin_cancel")
+    return builder.as_markup()
+
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
-    await state.clear() # Сбрасываем состояния, если админ нажал /admin
+    await state.clear()
     await message.answer("🔧 <b>Админ-панель</b>\n\nВыберите действие:", reply_markup=get_admin_kb())
 
 @dp.callback_query(F.data.startswith("admin_"))
@@ -226,18 +262,12 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.answer()
 
-def get_cancel_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Отмена", callback_data="admin_cancel")
-    return builder.as_markup()
-
 @dp.callback_query(F.data == "admin_cancel", AdminStates.waiting_for_broadcast)
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Рассылка отменена. Возвращаемся в меню.", reply_markup=get_admin_kb())
     await callback.answer()
 
-# Обработчик сообщения для рассылки
 @dp.message(AdminStates.waiting_for_broadcast)
 async def admin_broadcast_send(message: types.Message, state: FSMContext):
     await state.clear()
@@ -250,16 +280,15 @@ async def admin_broadcast_send(message: types.Message, state: FSMContext):
     
     for uid in user_ids:
         try:
-            # copy_to копирует любое сообщение (текст, медиа, кнопки) в неизменном виде
             await message.copy_to(chat_id=uid)
             success += 1
-            await asyncio.sleep(0.05) # Задержка, чтобы не словить лимит Telegram (30 сообщений в секунду)
+            await asyncio.sleep(0.05)
         except Exception:
-            failed += 1 # Если пользователь заблокировал бота
+            failed += 1
             
     await progress_msg.edit_text(f"✅ <b>Рассылка завершена!</b>\n\nУспешно отправлено: {success}\nНе доставлено (заблокировали бота): {failed}", reply_markup=get_admin_kb())
 
-# --- ДОНАТ ---
+# --- ДОНАТ (TELEGRAM STARS) ---
 @dp.message(Command("donate"))
 async def cmd_donate(message: types.Message):
     user = message.from_user
@@ -277,18 +306,24 @@ async def cmd_donate(message: types.Message):
 
 @dp.callback_query(F.data.startswith("donate_"))
 async def process_donate(callback: types.CallbackQuery):
-    try: amount = int(callback.data.removeprefix("donate_"))
+    try:
+        amount = int(callback.data.removeprefix("donate_"))
     except (TypeError, ValueError):
-        await callback.answer("Некорректная сумма.", show_alert=True); return
+        await callback.answer("Некорректная сумма.", show_alert=True)
+        return
 
     if amount not in DONATION_AMOUNTS:
-        await callback.answer("Некорректная сумма.", show_alert=True); return
+        await callback.answer("Некорректная сумма.", show_alert=True)
+        return
 
     await bot.send_invoice(
-        chat_id=callback.message.chat.id, title="Поддержка разработчика",
+        chat_id=callback.message.chat.id,
+        title="Поддержка разработчика",
         description=f"Оплата {amount} Telegram Stars в качестве благодарности",
-        payload=f"donate:{amount}", currency="XTR", 
-        prices=[LabeledPrice(label=f"{amount} Звезд", amount=amount)], provider_token="" 
+        payload=f"donate:{amount}",
+        currency="XTR", 
+        prices=[LabeledPrice(label=f"{amount} Звезд", amount=amount)],
+        provider_token="" 
     )
     await callback.answer()
 
@@ -297,11 +332,18 @@ async def pre_checkout_query(query: types.PreCheckoutQuery):
     try:
         prefix, amount_str = query.invoice_payload.split(":")
         amount = int(amount_str)
-        valid = (prefix == "donate" and amount in DONATION_AMOUNTS and query.currency == "XTR" and query.total_amount == amount)
-    except (ValueError, AttributeError): valid = False
+        valid = (
+            prefix == "donate"
+            and amount in DONATION_AMOUNTS
+            and query.currency == "XTR"
+            and query.total_amount == amount
+        )
+    except (ValueError, AttributeError):
+        valid = False
 
     if not valid:
-        await query.answer(ok=False, error_message="Некорректные параметры платежа."); return
+        await query.answer(ok=False, error_message="Некорректные параметры платежа.")
+        return
     await query.answer(ok=True)
 
 @dp.message(F.successful_payment)
@@ -309,7 +351,12 @@ async def successful_payment(message: types.Message):
     payment_info = message.successful_payment
     user = message.from_user
     if user: await add_donation(payment_info.telegram_payment_charge_id, user.id, payment_info.total_amount)
-    await message.answer(f"🎉 <b>Спасибо за вашу поддержку!</b>\n\nВы отправили {payment_info.total_amount} ⭐.\nБлагодаря вам бот будет работать и развиваться!")
+        
+    await message.answer(
+        f"🎉 <b>Спасибо за вашу поддержку!</b>\n\n"
+        f"Вы отправили {payment_info.total_amount} ⭐.\n"
+        f"Благодаря вам бот будет работать и развиваться!"
+    )
 
 # --- /start ---
 @dp.message(Command("start"))
@@ -327,8 +374,10 @@ async def cmd_start(message: types.Message):
 # --- ЗАПУСК ---
 async def main():
     await db_init()
-    try: await dp.start_polling(bot)
-    finally: await bot.session.close()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
